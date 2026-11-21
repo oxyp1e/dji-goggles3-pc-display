@@ -4,7 +4,8 @@ Stream your Mac screen to DJI Goggles 3 over the USB cable at 100 fps with about
 Good for FPV simulators, videos, or just a big private screen.
 
 How it works: `bin/sckenc` captures the screen with ScreenCaptureKit, encodes it with the Mac hardware H.264 encoder
-(VideoToolbox, always the newest frame, stale frames are dropped, never queued) and sends it over adb to the goggles. On the goggles, the Eyepiece bridge from
+(VideoToolbox, always the newest frame, stale frames are dropped, never queued) and sends it over adb to the
+goggles. On the goggles, the Eyepiece bridge from
 [natartos](https://github.com/grom-labs/natartos) decodes it with the hardware video decoder and puts it straight
 on the display. Root access comes from [toolya](https://github.com/grom-labs/toolya).
 
@@ -13,7 +14,7 @@ Tested: DJI Goggles 3, firmware 01.00.0900, MacBook Pro (Apple Silicon), macOS 1
 | | Result |
 |---|---|
 | Frame rate | 96-101 fps (the goggles panel runs at 100 Hz) |
-| Send to screen | 8-10 ms |
+| Send to screen | 8-12 ms |
 | Decode on goggles | ~3 ms |
 
 ## Risks, read first
@@ -27,7 +28,7 @@ Tested: DJI Goggles 3, firmware 01.00.0900, MacBook Pro (Apple Silicon), macOS 1
 ## What you need
 
 - DJI Goggles 3 (firmware 01.00.0900 to 01.00.1600 are known to work with toolya)
-- Mac with Apple Silicon and [Homebrew](https://brew.sh)
+- Mac with Apple Silicon, [Homebrew](https://brew.sh) and Xcode Command Line Tools (`xcode-select --install`)
 - A USB-C **data** cable. Many cables only charge. If the Mac does not see the goggles, try another cable.
 
 ## One-time install
@@ -58,16 +59,26 @@ Next time just start again from step 1.
 
 The goggles get warm when used for a long time, same as when flying. Turn them off when you do not use them.
 
+## Games (FPV simulators)
+
+1. In the game: resolution **1920x1080**, VSync **off**, frame limit **100** (or 120 / unlimited).
+2. Start the game, then in Terminal:
+   ```sh
+   cd dji-goggles3-pc-display
+   ./goggles.command --app liftoff
+   ```
+   `--app` takes part of the game's name and captures only its window. This is needed for fullscreen games:
+   capturing the whole screen gave only ~15 new frames per second. If the name is wrong, it prints the list of apps.
+3. Fly. Every 3 s the terminal shows `screen changes N/s` (about the game fps) and the stream stats.
+
 ## Tips
 
 - The goggles show exactly 1920x1080. A 16:10 Mac screen gets black bars on the sides. For a full picture,
   set the Mac display to a 16:9 resolution, or use a 16:9 external display.
 - `python3 scripts/eyepiece.py --start-bridge --bridge-opts=-b --screen 1` streams the second display.
 - `--fps 60` if the Mac is too slow for 100 fps.
-- Games: set the game resolution to 1920x1080 (the goggles size; 1920x1200 or Retina sizes cost the game fps and get
-  scaled), turn VSync off and set the frame limit to 100 (the goggles panel is 100 Hz).
-  `--app <name>` captures only that app's window, e.g. `--app liftoff`. Use it for fullscreen games: plain screen
-  capture of a fullscreen game gave only ~15 new frames per second.
+- Why 1920x1080 in games: that is the goggles size. 1920x1200 or Retina sizes cost the game fps and get scaled down
+  with black bars.
 - `--record /tmp/x.h264` saves what is sent (+ a .csv with times) for debugging. Lines starting with `STALL` show
   where a pause over 40 ms happened (capture, encoder, python, USB).
 - `--mbit 60` for a sharper picture in fast motion (default 40).

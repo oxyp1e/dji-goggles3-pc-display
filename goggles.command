@@ -27,4 +27,4 @@ if ! adb -s $S shell 'grep -q natartos_loader /proc/$(pidof dji_glasses)/maps' 2
 fi
 
 echo "Streaming. Press Back on the goggles or close this window to stop."
-python3 -I -u scripts/eyepiece.py --start-bridge --bridge-opts=-b 2>&1 | grep --line-buffered -v -E 'WARNING|objc|DUSS'
+python3 -I -u scripts/eyepiece.py --start-bridge --bridge-opts=-b "$@" 2>&1 | grep --line-buffered -v -E 'WARNING|objc|DUSS'
