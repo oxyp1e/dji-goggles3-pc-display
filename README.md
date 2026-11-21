@@ -64,8 +64,12 @@ The goggles get warm when used for a long time, same as when flying. Turn them o
   set the Mac display to a 16:9 resolution, or use a 16:9 external display.
 - `python3 scripts/eyepiece.py --start-bridge --bridge-opts=-b --screen 1` streams the second display.
 - `--fps 60` if the Mac is too slow for 100 fps.
-- Games: set the game frame limit to 100 (the goggles panel is 100 Hz). Windowed mode works best.
-  `--app <name>` captures only that app's window, e.g. `--app minecraft`.
+- Games: set the game resolution to 1920x1080 (the goggles size; 1920x1200 or Retina sizes cost the game fps and get
+  scaled), turn VSync off and set the frame limit to 100 (the goggles panel is 100 Hz).
+  `--app <name>` captures only that app's window, e.g. `--app liftoff`. Use it for fullscreen games: plain screen
+  capture of a fullscreen game gave only ~15 new frames per second.
+- `--record /tmp/x.h264` saves what is sent (+ a .csv with times) for debugging. Lines starting with `STALL` show
+  where a pause over 40 ms happened (capture, encoder, python, USB).
 - `--mbit 60` for a sharper picture in fast motion (default 40).
 - `--x264` uses the old CPU encoder (sckcap + ffmpeg libx264).
 - Every 3 s the terminal shows: capture/repeat/skipped frames per second, encode time, capture to send time,
@@ -89,6 +93,10 @@ Then reboot the goggles.
   and frames piled up (up to ~300 ms delay, blocky picture).
 - VideoToolbox low-latency rate control uses 15 reference frames, so the goggles decoder waits and stalls. It also
   caps an M1 Pro at ~70 fps. Normal mode with speed priority does ~100 fps with 1 reference frame.
+- VideoToolbox writes frame_num with 5 bits (0-31). The goggles decoder logged "Gaps in frame num" for frames 16-31
+  of every 32. sckenc rewrites the SPS and slice headers to a 4-bit frame_num (same header length, slice data
+  untouched). x264 already uses 4 bits.
+- sckenc sends exactly 100 frames per second on a steady clock. More than the panel rate only adds judder.
 - VideoToolbox can return frames out of order when 2 are in flight, so sckenc writes them in submit order.
 - x264 `ultrafast` + `zerolatency` with one slice per frame takes ~7-12 ms. With many slices the goggles showed a
   milky screen.

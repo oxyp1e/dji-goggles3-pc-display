@@ -34,6 +34,7 @@ ap.add_argument("--fps", type=int, default=100)
 ap.add_argument("--mbit", type=float, default=0, help="bitrate, default 40 (hardware) or 20 (--x264)")
 ap.add_argument("--secs", type=float, default=0)
 ap.add_argument("--screen", default="0")
+ap.add_argument("--record", default="", help="debug: also save the sent H.264 to this file (+ .csv with times)")
 ap.add_argument("--app", default="", help="capture only this app's window (name substring), e.g. --app minecraft")
 ap.add_argument("--start-bridge", action="store_true")
 ap.add_argument("--headtrack", action="store_true")
@@ -154,6 +155,8 @@ AUD = b"\x00\x00\x00\x01\x09"
 
 
 capsent = []  # capture -> sent ms (sckenc only)
+rec = open(args.record, "wb") if args.record else None
+reccsv = open(args.record + ".csv", "w") if args.record else None
 
 
 def send_au(au, key=None, cap_ns=0):
@@ -162,7 +165,13 @@ def send_au(au, key=None, cap_ns=0):
                   if au[i] == 0 and au[i + 1] == 0 and au[i + 2] == 1)
     pts = int(time.monotonic() * 1e6)
     sent_at[pts] = time.monotonic()
+    t_s = time.monotonic()
     sock.sendall(msg(0x01, struct.pack("<QB3x", pts, 0) + au, 1 if key else 0))
+    if time.monotonic() - t_s > 0.04:
+        print(f"STALL send to goggles (adb/USB) {(time.monotonic() - t_s) * 1000:.0f} ms", flush=True)
+    if rec:
+        rec.write(au)
+        reccsv.write(f"{cap_ns},{time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)},{len(au)},{int(key)}\n")
     if cap_ns:
         capsent.append((time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) - cap_ns) / 1e6)
 

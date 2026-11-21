@@ -33,15 +33,21 @@ var latestIsNew = false
 var inFlight = 0
 let MAXFLIGHT = Int(ProcessInfo.processInfo.environment["SCKENC_INFLIGHT"] ?? "") ?? 2
 var lastSubmit: UInt64 = 0
+var nextDue: UInt64 = 0
+let interval = UInt64(1e9 / Double(FPS))
 var frameIndex: Int64 = 0
 var capOf: [UInt64: UInt64] = [:]  // submit ns -> capture ns
 var st = (new: 0, repeats: 0, skipped: 0, enc: 0, encUs: 0, bytes: 0, maxEncUs: 0, dropped: 0)
+var bigChange = 0  // frames where >10% of the screen changed (= real game frames, not just the cursor)
 
 // ---- encoder
 var session: VTCompressionSession?
 let outLock = NSLock()
 
+var lastNew: UInt64 = 0
+func stall(_ what: String, _ ms: Double) { if ms > 40 { log(String(format: "sckenc: STALL %@ %.0f ms", what, ms)) } }
 func writeAll(_ d: Data) {
+    let t0 = nowNs(); defer { stall("write to python (python/adb busy)", Double(nowNs() - t0) / 1e6) }
     d.withUnsafeBytes { p in
         var off = 0
         while off < d.count {
@@ -67,7 +73,7 @@ let outputCallback: VTCompressionOutputCallback = { _, srcRef, status, _, sb in
     lock.lock(); let seq = seqOf.removeValue(forKey: submitNs) ?? nextOut; lock.unlock()
     ready[seq] = rec ?? Data()
     while let r = ready.removeValue(forKey: nextOut) {
-        if !r.isEmpty { writeAll(r) }
+        if !r.isEmpty { writeAll(fixRecord(r)) }
         nextOut += 1
     }
     outLock.unlock()
@@ -113,9 +119,116 @@ func makeRecord(_ submitNs: UInt64, _ status: OSStatus, _ sb: CMSampleBuffer?) -
     rec += au
     lock.lock()
     let us = Int((encNs - submitNs) / 1000)
+    stall("encoder", Double(us) / 1000)
     st.enc += 1; st.encUs += us; st.maxEncUs = max(st.maxEncUs, us); st.bytes += au.count
     lock.unlock()
     return rec
+}
+
+
+// ---- frame_num fix for the goggles decoder
+// VideoToolbox writes frame_num with 5 bits (0..31). The goggles' Hantro decoder seems to wrap it at 16: it logs
+// "Gaps in frame num" for frames 16..31 of every 32 and shows them badly (felt like 15-50 fps in games).
+// We rewrite the SPS to 4-bit frame_num and move the spare bit to pic_order_cnt_lsb, and rewrite every slice
+// header to match. Header length stays the same, so the slice data is untouched.
+let FIX = ProcessInfo.processInfo.environment["SCKENC_NOFIX"] == nil
+var fnBits = 0, pocBits = 0, newPocBits = 0, frameSinceIdr = 0, fixOn = false
+
+func unescape(_ b: ArraySlice<UInt8>) -> [UInt8] {
+    var o: [UInt8] = []; o.reserveCapacity(b.count); var z = 0
+    for x in b { if z >= 2 && x == 3 { z = 0; continue }; o.append(x); z = x == 0 ? z + 1 : 0 }
+    return o
+}
+func escape(_ b: [UInt8]) -> [UInt8] {
+    var o: [UInt8] = []; o.reserveCapacity(b.count + 4); var z = 0
+    for x in b { if z >= 2 && x <= 3 { o.append(3); z = 0 }; o.append(x); z = x == 0 ? z + 1 : 0 }
+    return o
+}
+struct Bits {
+    var b: [UInt8] = []  // one bit per element
+    var p = 0
+    init(_ bytes: [UInt8]) { for x in bytes { for i in (0..<8).reversed() { b.append((x >> UInt8(i)) & 1) } } }
+    mutating func u(_ n: Int) -> Int { var v = 0; for _ in 0..<n { v = v << 1 | Int(b[p]); p += 1 }; return v }
+    mutating func ue() -> Int { var z = 0; while b[p] == 0 { z += 1; p += 1 }; p += 1; return (1 << z) - 1 + u(z) }
+}
+func putU(_ o: inout [UInt8], _ v: Int, _ n: Int) { for i in (0..<n).reversed() { o.append(UInt8((v >> i) & 1)) } }
+func putUE(_ o: inout [UInt8], _ v: Int) { let x = v + 1; let n = Int.bitWidth - x.leadingZeroBitCount; putU(&o, 0, n - 1); putU(&o, x, n) }
+func pack(_ bits: [UInt8]) -> [UInt8] {
+    var o = [UInt8](repeating: 0, count: (bits.count + 7) / 8)
+    for (i, x) in bits.enumerated() where x != 0 { o[i / 8] |= 0x80 >> UInt8(i % 8) }
+    return o
+}
+
+func fixSPS(_ nal: [UInt8]) -> [UInt8] {  // nal = escaped NAL incl. header byte
+    var r = Bits(unescape(nal[1...]))
+    let prof = r.u(8); _ = r.u(16); _ = r.ue()
+    if [100, 110, 122, 244, 44, 83, 86, 118, 128].contains(prof) {
+        let cf = r.ue(); if cf == 3 { _ = r.u(1) }; _ = r.ue(); _ = r.ue(); _ = r.u(1)
+        if r.u(1) == 1 { fixOn = false; return nal }  // scaling matrices: not handled
+    }
+    let start = r.p
+    fnBits = r.ue() + 4
+    let pocType = r.ue()
+    guard pocType == 0 else { fixOn = false; return nal }
+    pocBits = r.ue() + 4
+    let rest = r.p
+    guard fnBits > 4 else { fixOn = false; return nal }
+    newPocBits = min(16, pocBits + fnBits - 4)
+    var o = Array(r.b[0..<start])
+    putUE(&o, 0); putUE(&o, 0); putUE(&o, newPocBits - 4)
+    var tail = Array(r.b[rest...])
+    while let l = tail.last, l == 0 { tail.removeLast() }  // drop rbsp trailing bits, re-add below
+    tail.removeLast()
+    o += tail; o.append(1); while o.count % 8 != 0 { o.append(0) }
+    fixOn = true
+    return [nal[0]] + escape(pack(o))
+}
+
+func fixSlice(_ nal: [UInt8]) -> [UInt8] {
+    let idr = nal[0] & 31 == 5
+    if idr { frameSinceIdr = 0 }
+    defer { frameSinceIdr += 1 }
+    // split: a prefix that holds the header, cut after a non-zero byte so escaping of the rest is unchanged
+    var cut = min(nal.count, 24)
+    while cut < nal.count && (nal[cut - 1] == 0 || nal[cut - 1] == 3) { cut += 1 }
+    var r = Bits(unescape(nal[1..<cut]))
+    _ = r.ue(); _ = r.ue(); _ = r.ue()
+    let fnAt = r.p; _ = r.u(fnBits)
+    if idr { _ = r.ue() }
+    let pocAt = r.p; _ = r.u(pocBits)
+    let after = r.p
+    var o = Array(r.b[0..<fnAt])
+    putU(&o, frameSinceIdr % 16, 4)
+    o += r.b[(fnAt + fnBits)..<pocAt]
+    putU(&o, frameSinceIdr % (1 << newPocBits), newPocBits)
+    o += r.b[after...]
+    guard o.count == r.b.count else { return nal }
+    return [nal[0]] + escape(pack(o)) + Array(nal[cut...])
+}
+
+// records arrive here in stream order (frame counter must follow output order)
+func fixRecord(_ r: Data) -> Data {
+    guard FIX else { return r }
+    let au = fixAU(r.subdata(in: (r.startIndex + 25)..<r.endIndex))
+    var o = Data(r[r.startIndex..<(r.startIndex + 4)]); o += le(UInt32(au.count))
+    o += r[(r.startIndex + 8)..<(r.startIndex + 25)]; o += au
+    return o
+}
+
+func fixAU(_ au: Data) -> Data {
+    let b = [UInt8](au)
+    var starts: [Int] = []  // positions after 00 00 00 01
+    var i = 0
+    while i + 4 <= b.count { if b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 0 && b[i + 3] == 1 { starts.append(i + 4); i += 4 } else { i += 1 } }
+    var out = Data()
+    for (k, s) in starts.enumerated() {
+        let e = k + 1 < starts.count ? starts[k + 1] - 4 : b.count
+        var nal = Array(b[s..<e])
+        let t = nal[0] & 31
+        if t == 7 { nal = fixSPS(nal) } else if fixOn && (t == 1 || t == 5) { nal = fixSlice(nal) }
+        out += [0, 0, 0, 1]; out += nal
+    }
+    return out
 }
 
 func makeSession() {
@@ -155,20 +268,21 @@ func kick(repeatOnly: Bool = false) {
     guard let s = session, let pb = latest, inFlight < MAXFLIGHT else {  // busy: picked up when an encode finishes
         lock.unlock(); return
     }
+    // Steady cadence of exactly FPS frames/s (the goggles panel is 100 Hz; more than that only causes judder).
+    // A new frame goes out at once if its slot is (almost) due, otherwise at its slot. No new frame at the
+    // slot = repeat the last one.
     let t = nowNs()
-    let interval = UInt64(1e9 / Double(FPS))
-    if repeatOnly {
-        if latestIsNew || t - lastSubmit < interval { lock.unlock(); return }
-        st.repeats += 1
-    } else if !latestIsNew {
-        lock.unlock(); return
-    }
+    let slack: UInt64 = repeatOnly ? 0 : 2_000_000
+    if t + slack < nextDue { lock.unlock(); return }
+    let isRepeat = !latestIsNew
+    if isRepeat { st.repeats += 1 }
+    nextDue = max(nextDue, t &- interval / 2) + interval
     latestIsNew = false
     inFlight += 1
     lastSubmit = t
     frameIndex += 1
     seqOf[t] = frameIndex
-    capOf[t] = repeatOnly ? t : latestCapNs  // a repeat counts as captured now
+    capOf[t] = isRepeat ? t : latestCapNs  // a repeat counts as captured now
     let pts = CMTime(value: CMTimeValue(t), timescale: 1_000_000_000)  // must increase: repeats get a fresh pts
     lock.unlock()
     let err = VTCompressionSessionEncodeFrame(s, imageBuffer: pb, presentationTimeStamp: pts, duration: .invalid,
@@ -176,7 +290,7 @@ func kick(repeatOnly: Bool = false) {
     if err != noErr {  // no callback will come for this frame: mark it as dropped
         log("sckenc: encode error \(err)")
         outLock.lock(); lock.lock(); let seq = seqOf.removeValue(forKey: t) ?? 0; inFlight -= 1; lock.unlock()
-        ready[seq] = Data(); while let r = ready.removeValue(forKey: nextOut) { if !r.isEmpty { writeAll(r) }; nextOut += 1 }
+        ready[seq] = Data(); while let r = ready.removeValue(forKey: nextOut) { if !r.isEmpty { writeAll(fixRecord(r)) }; nextOut += 1 }
         outLock.unlock()
     }
 }
@@ -186,12 +300,21 @@ final class Output: NSObject, SCStreamOutput, SCStreamDelegate {
         guard type == .screen, let pb = CMSampleBufferGetImageBuffer(sb) else { return }
         if let att = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
            let raw = att.first?[.status] as? Int, let s = SCFrameStatus(rawValue: raw), s != .complete { return }
+        var area = 0.0
+        if let att = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+           let rects = att.first?[.dirtyRects] as? [NSDictionary] {
+            for d in rects { if let r = CGRect(dictionaryRepresentation: d) { area += Double(r.width * r.height) } }
+            if let sr = att.first?[.contentRect] as? NSDictionary, let c = CGRect(dictionaryRepresentation: sr),
+               let sf = att.first?[.scaleFactor] as? Double { area /= Double(c.width * c.height) * sf * sf }
+        }
         lock.lock()
+        if area > 0.1 { bigChange += 1 }
         if latestIsNew { st.skipped += 1 }  // previous new frame never got encoded: dropped, not queued
         latest = pb
         latestCapNs = UInt64(CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb)) * 1e9)
         latestIsNew = true
         st.new += 1
+        let tn = nowNs(); if lastNew > 0 { stall("no new frame from macOS capture", Double(tn - lastNew) / 1e6) }; lastNew = tn
         lock.unlock()
         kick()
     }
@@ -220,11 +343,24 @@ Task {
         var filter = SCContentFilter(display: display, excludingWindows: [])
         var what = "display \(display.displayID) \(display.width)x\(display.height)"
         if !APP.isEmpty {
-            let wins = content.windows.filter { ($0.owningApplication?.applicationName.lowercased() ?? "").contains(APP) && $0.frame.width > 100 }
-            guard let w = wins.max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }) else {
-                let apps = Set(content.windows.compactMap { $0.owningApplication?.applicationName }).sorted()
-                log("sckenc: no window for app '\(APP)'. Apps: \(apps.joined(separator: ", "))"); exit(1)
+            // A fullscreen game lives in its own Space, so it is not "on screen" while Terminal is in front:
+            // search all windows, by app name, bundle id or window title.
+            func match(_ w: SCWindow) -> Bool {
+                let keys = [w.owningApplication?.applicationName, w.owningApplication?.bundleIdentifier, w.title]
+                return w.frame.width > 300 && w.frame.height > 200 && keys.contains { ($0 ?? "").lowercased().contains(APP) }
             }
+            var found: SCWindow?
+            for i in 0..<30 {  // the game may still be starting
+                let all = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
+                found = all.windows.filter(match).max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
+                if found != nil { break }
+                if i == 0 {
+                    let apps = Set(all.windows.filter { $0.frame.width > 300 }.compactMap { $0.owningApplication?.applicationName }).sorted()
+                    log("sckenc: no window for '\(APP)' yet, waiting. Apps with windows: \(apps.joined(separator: ", "))")
+                }
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+            guard let w = found else { log("sckenc: no window for '\(APP)'"); exit(1) }
             filter = SCContentFilter(desktopIndependentWindow: w)
             what = "window '\(w.title ?? "")' of \(w.owningApplication?.applicationName ?? "") \(Int(w.frame.width))x\(Int(w.frame.height))"
         }
@@ -244,9 +380,9 @@ if ProcessInfo.processInfo.environment["SCKENC_STATS"] != nil {
     Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
         lock.lock()
         let e = max(st.enc, 1)
-        log("sckenc: capture \(st.new / 3)/s repeat \(st.repeats / 3)/s skipped \(st.skipped / 3)/s | encoded \(st.enc / 3)/s "
+        log("sckenc: screen changes \(bigChange / 3)/s | capture \(st.new / 3)/s repeat \(st.repeats / 3)/s skipped \(st.skipped / 3)/s | encoded \(st.enc / 3)/s "
             + "enc \(st.encUs / e / 1000).\(st.encUs / e / 100 % 10) ms avg \(st.maxEncUs / 1000) max | \(st.bytes * 8 / 3 / 1000) kbit/s | vt dropped \(st.dropped)")
-        st = (0, 0, 0, 0, 0, 0, 0, 0)
+        st = (0, 0, 0, 0, 0, 0, 0, 0); bigChange = 0
         lock.unlock()
     }
 }
