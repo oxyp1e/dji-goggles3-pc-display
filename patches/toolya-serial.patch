@@ -1,0 +1,16 @@
+diff --git a/cli/src/natartos.rs b/cli/src/natartos.rs
+index e78a487..7a20c1b 100644
+--- a/cli/src/natartos.rs
++++ b/cli/src/natartos.rs
+@@ -340,7 +340,10 @@ pub fn adb_device() -> Result<AdbConn, String> {
+         let ip: Ipv4Addr = parts[0].parse().map_err(|e| format!("bad ADB host IP: {e}"))?;
+         let port: u16 = parts.get(1).unwrap_or(&"5037").parse().map_err(|e| format!("bad ADB port: {e}"))?;
+         let mut server = ADBServer::new(SocketAddrV4::new(ip, port));
+-        let dev = server.get_device().map_err(|e| format!("ADB server {addr}: {e}"))?;
++        let dev = match std::env::var("NATARTOS_ADB_SERIAL") {
++            Ok(serial) => server.get_device_by_name(&serial),
++            Err(_) => server.get_device(),
++        }.map_err(|e| format!("ADB server {addr}: {e}"))?;
+         return Ok(AdbConn::Server(dev));
+     }
+     let dev = ADBUSBDevice::autodetect().map_err(|e| format!("USB device not found: {e}"))?;
