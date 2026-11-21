@@ -3,8 +3,8 @@
 Stream your Mac screen to DJI Goggles 3 over the USB cable at 100 fps with about 10 ms from send to screen.
 Good for FPV simulators, videos, or just a big private screen.
 
-How it works: the Mac captures the screen with ScreenCaptureKit, encodes it with x264 (low-latency settings)
-and sends it over adb to the goggles. On the goggles, the Eyepiece bridge from
+How it works: `bin/sckenc` captures the screen with ScreenCaptureKit, encodes it with the Mac hardware H.264 encoder
+(VideoToolbox, always the newest frame, stale frames are dropped, never queued) and sends it over adb to the goggles. On the goggles, the Eyepiece bridge from
 [natartos](https://github.com/grom-labs/natartos) decodes it with the hardware video decoder and puts it straight
 on the display. Root access comes from [toolya](https://github.com/grom-labs/toolya).
 
@@ -64,6 +64,12 @@ The goggles get warm when used for a long time, same as when flying. Turn them o
   set the Mac display to a 16:9 resolution, or use a 16:9 external display.
 - `python3 scripts/eyepiece.py --start-bridge --bridge-opts=-b --screen 1` streams the second display.
 - `--fps 60` if the Mac is too slow for 100 fps.
+- Games: set the game frame limit to 100 (the goggles panel is 100 Hz). Windowed mode works best.
+  `--app <name>` captures only that app's window, e.g. `--app minecraft`.
+- `--mbit 60` for a sharper picture in fast motion (default 40).
+- `--x264` uses the old CPU encoder (sckcap + ffmpeg libx264).
+- Every 3 s the terminal shows: capture/repeat/skipped frames per second, encode time, capture to send time,
+  round trip to the goggles screen, drops.
 
 ## Remove everything
 
@@ -78,8 +84,14 @@ Then reboot the goggles.
 
 - ffmpeg's avfoundation screen capture gives only ~20 fps on a Retina Mac. `bin/sckcap` uses ScreenCaptureKit
   and gets 60-120 fps, scaled on the GPU.
-- The Mac hardware encoder (VideoToolbox through ffmpeg) holds ~110 ms of frames. x264 `ultrafast` + `zerolatency`
-  with one slice per frame takes ~7-12 ms. With many slices the goggles showed a milky screen.
+- The Mac hardware encoder through ffmpeg holds ~110 ms of frames. Called directly from Swift (`sckenc`) with at most
+  2 frames inside, it takes ~11-15 ms per frame and leaves the CPU to the game. x264 on the CPU fell behind in games
+  and frames piled up (up to ~300 ms delay, blocky picture).
+- VideoToolbox low-latency rate control uses 15 reference frames, so the goggles decoder waits and stalls. It also
+  caps an M1 Pro at ~70 fps. Normal mode with speed priority does ~100 fps with 1 reference frame.
+- VideoToolbox can return frames out of order when 2 are in flight, so sckenc writes them in submit order.
+- x264 `ultrafast` + `zerolatency` with one slice per frame takes ~7-12 ms. With many slices the goggles showed a
+  milky screen.
 - The goggles panel is 100 Hz. 60 fps looks jerky on it (frames last 10, 20 or 30 ms). 100 fps is smooth.
 - On firmware 0900 the overlay from natartos v0.1.0 cannot hide the goggles UI, so the video sits under an old frame.
   The release uses the overlay from natartos PR #4, which can.

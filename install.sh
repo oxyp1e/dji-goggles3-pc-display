@@ -8,6 +8,7 @@ TAG=${TAG:-v1.0}
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 
 command -v brew >/dev/null || { echo "Install Homebrew first: https://brew.sh"; exit 1; }
+command -v swiftc >/dev/null || { echo "Install Xcode Command Line Tools first: xcode-select --install"; exit 1; }
 command -v ffmpeg >/dev/null || brew install ffmpeg
 command -v adb >/dev/null || brew install --cask android-platform-tools
 
@@ -18,6 +19,7 @@ curl -fL -o bin/toolya "$base/toolya-macos-arm64"
 curl -fL -o bin/sckcap "$base/sckcap-macos-arm64"
 curl -fL -o dist.tar.gz "$base/natartos-eyepiece-dist.tar.gz"
 tar -xzf dist.tar.gz -C dist && rm dist.tar.gz
+swiftc -O -o bin/sckenc scripts/sckenc/main.swift
 chmod +x bin/toolya bin/sckcap goggles.command
 
 # toolya telemetry off

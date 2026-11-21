@@ -31,15 +31,17 @@ W, H = 1920, 1080
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--fps", type=int, default=100)
-ap.add_argument("--mbit", type=float, default=20)
+ap.add_argument("--mbit", type=float, default=0, help="bitrate, default 40 (hardware) or 20 (--x264)")
 ap.add_argument("--secs", type=float, default=0)
 ap.add_argument("--screen", default="0")
+ap.add_argument("--app", default="", help="capture only this app's window (name substring), e.g. --app minecraft")
 ap.add_argument("--start-bridge", action="store_true")
 ap.add_argument("--headtrack", action="store_true")
 ap.add_argument("--avf", action="store_true", help="capture with ffmpeg avfoundation (only ~20 fps); default is sckcap (ScreenCaptureKit)")
 ap.add_argument("--source", default="", help="lavfi test source instead of the screen, e.g. testsrc")
 ap.add_argument("--gop", type=int, default=0)
-ap.add_argument("--vt", action="store_true", help="VideoToolbox encoder (adds ~110 ms; default is x264 zerolatency)")
+ap.add_argument("--vt", action="store_true", help="ffmpeg h264_videotoolbox (adds ~110 ms, debug only)")
+ap.add_argument("--x264", action="store_true", help="old path: sckcap -> ffmpeg libx264 (CPU). Default is bin/sckenc (hardware, newest frame only)")
 ap.add_argument("--disp-ts", default="", help="EYEPIECE_DISP_TS for --start-bridge: keep|zero|now")
 ap.add_argument("--bridge-opts", default="", help="extra eyepiece_bridge options, e.g. '-O fb'")
 args = ap.parse_args()
@@ -73,7 +75,7 @@ if not sock:
 sock.settimeout(None)
 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-stats = {"frames": 0, "lat": [], "dec": [], "drop": 0, "q": 0}
+stats = {"frames": 0, "lat": [], "dec": [], "gs": [], "drop": 0, "q": 0}
 sent_at = {}
 
 
@@ -101,6 +103,7 @@ def reader():
                 pts, trecv, tshown, dec_us, conv_us, q, drop = struct.unpack_from("<QQQIIII", p)
                 stats["frames"] += 1
                 stats["dec"].append(dec_us)
+                stats["gs"].append((tshown - trecv) / 1000)  # goggles: received -> shown, ms
                 stats["drop"], stats["q"] = drop, q
                 t0 = sent_at.pop(pts, None)
                 if t0:  # PC send -> goggles "shown" ack received back (round trip incl. return)
@@ -116,11 +119,21 @@ sock.sendall(msg(0x04, struct.pack("<HHBBH", W, H, 0, args.fps, 0)))
 if args.headtrack:
     sock.sendall(msg(0x03, bytes([3, 1])))
 
-kbit = int(args.mbit * 1000)
+SCKENC = not (args.x264 or args.vt or args.avf or args.source)
+kbit = int((args.mbit or (40 if SCKENC else 20)) * 1000)
 SCKCAP = __import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "..", "bin", "sckcap")
-cap = None if (args.source or args.avf) else subprocess.Popen(
+SCKENC_BIN = SCKCAP.replace("sckcap", "sckenc")
+if SCKENC:
+    import os
+    src = os.path.join(os.path.dirname(SCKCAP), "..", "scripts", "sckenc", "main.swift")
+    if not os.path.exists(SCKENC_BIN) or os.path.getmtime(SCKENC_BIN) < os.path.getmtime(src):
+        print("building bin/sckenc...", flush=True)
+        subprocess.run(["swiftc", "-O", "-o", SCKENC_BIN, src], check=True)
+enc = subprocess.Popen([SCKENC_BIN, str(W), str(H), str(args.fps), args.screen, str(kbit), str(args.gop), args.app],
+                       stdout=subprocess.PIPE, bufsize=0, env={**__import__("os").environ, "SCKENC_STATS": "1"}) if SCKENC else None
+cap = None if (args.source or args.avf or SCKENC) else subprocess.Popen(
     [SCKCAP, str(W), str(H), str(args.fps), args.screen], stdout=subprocess.PIPE)
-ff = subprocess.Popen(
+ff = None if SCKENC else subprocess.Popen(
     ["ffmpeg", "-hide_banner", "-loglevel", "error",
      *(["-re", "-f", "lavfi", "-i", f"{args.source}=size={W}x{H}:rate={args.fps}"] if args.source else
        ["-f", "avfoundation", "-capture_cursor", "1", "-framerate", str(args.fps),
@@ -140,19 +153,45 @@ ff = subprocess.Popen(
 AUD = b"\x00\x00\x00\x01\x09"
 
 
-def send_au(au):
-    key = any((au[i + 3] & 0x1F) == 5 for i in range(len(au) - 4)
-              if au[i] == 0 and au[i + 1] == 0 and au[i + 2] == 1)
+capsent = []  # capture -> sent ms (sckenc only)
+
+
+def send_au(au, key=None, cap_ns=0):
+    if key is None:
+        key = any((au[i + 3] & 0x1F) == 5 for i in range(len(au) - 4)
+                  if au[i] == 0 and au[i + 1] == 0 and au[i + 2] == 1)
     pts = int(time.monotonic() * 1e6)
     sent_at[pts] = time.monotonic()
     sock.sendall(msg(0x01, struct.pack("<QB3x", pts, 0) + au, 1 if key else 0))
+    if cap_ns:
+        capsent.append((time.clock_gettime_ns(time.CLOCK_UPTIME_RAW) - cap_ns) / 1e6)
+
+
+def read_exact(f, n):
+    b = b""
+    while len(b) < n:
+        c = f.read(n - len(b))
+        if not c:
+            raise EOFError
+        b += c
+    return b
 
 
 buf, n, t0, last = b"", 0, time.time(), time.time()
 try:
     while True:
-        chunk = ff.stdout.read(262144)
-        if not chunk:
+        if SCKENC:
+            try:
+                hdr = read_exact(enc.stdout, 25)
+                ln, cap_ns, enc_ns, key = struct.unpack_from("<IQQB", hdr, 4)
+                send_au(read_exact(enc.stdout, ln), bool(key), cap_ns)
+            except EOFError:
+                break
+            n += 1
+            chunk = b""
+        else:
+            chunk = ff.stdout.read(262144)
+        if not chunk and not SCKENC:
             break
         buf += chunk
         while True:
@@ -174,11 +213,13 @@ try:
             lat, dec = stats["lat"][-100:], stats["dec"][-100:]
             el = now - last
             print(f"sent {n} AU | shown {stats['frames']} ({stats['frames']/el:.0f} fps) | "
-                  f"rtt {sorted(lat)[len(lat)//2] if lat else 0:.0f} ms med | "
+                  + (f"cap->sent {sorted(capsent)[len(capsent)//2]:.0f}/{max(capsent):.0f} ms med/max | " if capsent else "")
+                  + f"rtt {sorted(lat)[len(lat)//2] if lat else 0:.0f}/{max(lat) if lat else 0:.0f} ms med/max | "
+                  f"goggles recv->shown {sorted(stats['gs'])[len(stats['gs'])//2] if stats['gs'] else 0:.0f} ms | "
                   f"decode {sorted(dec)[len(dec)//2]/1000 if dec else 0:.1f} ms | q {stats['q']} drop {stats['drop']}"
                   + (f" | pose {stats['pose']}" if "pose" in stats else ""), flush=True)
             stats["frames"], n, last = 0, 0, now
-            stats["lat"].clear(); stats["dec"].clear()
+            stats["lat"].clear(); stats["dec"].clear(); stats["gs"].clear(); capsent.clear()
             if len(sent_at) > 2000:
                 sent_at.clear()
         if args.secs and now - t0 > args.secs:
@@ -186,7 +227,9 @@ try:
 except (BrokenPipeError, ConnectionResetError) as e:
     print("connection lost:", e)
 finally:
-    ff.kill()
+    for p in (ff, enc):
+        if p:
+            p.kill()
     if cap:
         cap.kill()
     try:
